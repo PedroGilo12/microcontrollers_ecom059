@@ -1,6 +1,11 @@
 #include <avr/io.h>
 
 ; --- Mapeamento de Hardware ---
+; Pinos do buzzer
+.equiv BUZZER_PORT, PORTD    
+.equiv BUZZER_DDR, DDRD
+.equiv BUZZER_PIN, 7
+    
 ; Pinos de chaveamento dos displays
 .equiv DISPLAY_PORT,    PORTB
 .equiv DISPLAY_DDR,     DDRB
@@ -35,15 +40,33 @@
 ; Mascara com os tres botoes
 .equiv BTN_MASK,        (1 << BTN_MODE_PIN) | (1 << BTN_START_PIN) | (1 << BTN_RESET_PIN)
 
+; --- Definicoes de Configuracao ---
+; Calculo para 1ms @ 16MHz:
+; F_CPU / (Prescaler * Desired_Freq) - 1
+; 16.000.000 / (64 * 1000) - 1 = 249
+.equiv TIMER_TOP, 249		    ; Valor de comparacao para 1ms
+
+.equiv DISPLAY_POOL_PERIOD_TICK, 3  ; Chaveamento a 30hz, periodo (8) = (1/30)/4, 4 = numero de displays
+.equiv MAIN_CLOCK_PERIOD_TICK, 1000 ; Periodo de atualizacao do valor a cada 1 segundo
+.equiv BLINK_PERIOD, 250	    ; pisca a cada 250ms   
+.equiv BUZZER_DURATION, 100	    ; duracao do bip em ms   
+    
+; --- Estados da maquina de estados ---    
+.equiv FSM_MODE1, 1 
+.equiv FSM_MODE2_STOPPED, 2
+.equiv FSM_MODE2_RUNNING, 3
+.equiv FSM_MODE3, 4    
+    
 ; A ideia e simular o que o "tick" de um OS represente
 ; ou seja, o menor tempo possivel para execucao de uma tarefa
 ; Para isso o Timer1 vai estourar a cada 1 segundo
 ; E cada tarefa vai possui um contador que sera decrementado
 .section .bss
+    
 display_pool_tick_counter: .byte 1	; Reserva 1 byte para armazenar o contador de tick que chaveia os displays
-main_clock_tick_counter_low: .byte 1    ; Reserva 2 bytes para o contador natural do relogio 
-main_clock_tick_counter_high: .byte 1   ; Reserva 2 bytes para o contador natural do relogio
-blink_counter: .byte 1    ; contador para piscar o dígito selecionado    
+main_clock_tick_counter_low: .byte 1    ; Reserva 2 bytes para o contador do relogio 
+main_clock_tick_counter_high: .byte 1   ; Reserva 2 bytes para o contador do relogio
+blink_counter: .byte 1			; contador para piscar o digito selecionado    
 
 ;  Flags
 display_pool_event_flag: .byte 1
@@ -57,6 +80,10 @@ btn_reset_flag:   .byte 1
     
 uart_print_flag: .byte 1   ; levantada quando deve imprimir na serial no modo 1   
 
+buzzer_flag:        .byte 1    ; 1 = bip solicitado
+buzzer_active:      .byte 1    ; 1 = Timer2 estï¿½ gerando tom
+buzzer_counter:     .byte 1    ; contador de duraï¿½ï¿½o em ms    
+    
 ; Estado atual
 current_mode: .byte 1    
     
@@ -90,16 +117,6 @@ selected_digit: .byte 1
     
 display_digits:     .byte 4
     
-; --- Definicoes de Configuracao ---
-; Calculo para 1ms @ 16MHz:
-; F_CPU / (Prescaler * Desired_Freq) - 1
-; 16.000.000 / (64 * 1000) - 1 = 249
-.equiv TIMER_TOP, 249        ; Valor de comparacao para 1ms
-
-.equiv DISPLAY_POOL_PERIOD_TICK, 8  ; Chaveamento a 30hz, periodo = (1/30)/4, 4 = numero de displays
-.equiv MAIN_CLOCK_PERIOD_TICK, 1000 ; Periodo de atualizacao do valor a cada 1 segundo
-.equiv BLINK_PERIOD, 250  ; pisca a cada 250ms   
-    
 ; --- Registradores para armazenar as contagens regressivas das tarefas
 .section .text
     
@@ -123,6 +140,7 @@ str_modo3_dmin:  .ascii "[MODO 3] Ajustando a dezena dos minutos"
 .global main
 .global __vector_14          ; Vetor de interrupcao: TIMER0_COMPA
 .global __vector_5           ; Vetor de interrupcao: PCINT2 (PORTD)
+.global __vector_7           ; Vetor de interrupcao: TIMER2_COMPA
  
 ; --- Rotina de Interrupcao ---
 __vector_14:
@@ -144,7 +162,7 @@ _check_blink_counter:
     breq _blink_tick
     dec r16
     sts blink_counter, r16
-    rjmp _check_main_clock      ; continua para o clock principal
+    rjmp _check_buzzer      ; continua para o clock principal
 
 _check_main_clock:
     ; Decrementa e verifica o contador do relogio principal
@@ -186,13 +204,34 @@ _display_tick:
     rjmp _check_blink_counter
     
  _blink_tick:
-    ; Recarrega o período
+    ; Recarrega o perï¿½odo
     ldi r16, BLINK_PERIOD
     sts blink_counter, r16
     ; Levanta a flag
     ldi r16, 1
     sts blink_event_flag, r16
+    rjmp _check_buzzer
+    
+_check_buzzer:
+    lds r16, buzzer_active
+    tst r16
+    breq _check_main_clock       ; buzzer nao estiver ativo
+
+    lds r16, buzzer_counter
+    tst r16
+    breq _buzzer_off             ; contador chegou a 0: desliga
+    dec r16
+    sts buzzer_counter, r16
     rjmp _check_main_clock
+
+_buzzer_off:
+    ; Desliga Timer2 (para o tom)
+    ldi r16, 0
+    sts TCCR2B, r16
+    sts buzzer_active, r16
+    ; Garante PD7 em LOW
+    cbi _SFR_IO_ADDR(BUZZER_PORT), BUZZER_PIN
+    rjmp _check_main_clock    
     
 _main_clock_tick:
     ; Recarrega o periodo
@@ -248,6 +287,24 @@ __vector_5:
 
 _end_pcint2:
     pop r18
+    pop r17
+    pop r16
+    out _SFR_IO_ADDR(SREG), r16
+    pop r16
+    reti
+    
+__vector_7:
+    push r16
+    in r16, _SFR_IO_ADDR(SREG)
+    push r16
+    push r17
+
+    ; Toggle PD7
+    in r16, _SFR_IO_ADDR(BUZZER_PORT)    
+    ldi r17, (1 << BUZZER_PIN)
+    eor r16, r17
+    out _SFR_IO_ADDR(BUZZER_PORT), r16
+
     pop r17
     pop r16
     out _SFR_IO_ADDR(SREG), r16
@@ -337,7 +394,20 @@ main:
     ldi r16, (1 << UCSZ01) | (1 << UCSZ00)
     sts UCSR0C, r16
     
+    ; -- Configuracao do timer2 para o buzzer
+    ; Timer2: modo CTC, sem prescaler
+    ldi r16, (1 << WGM21)
+    sts TCCR2A, r16
+    ldi r16, 124
+    sts OCR2A, r16
+
+    ldi r16, 0
+    sts TCCR2B, r16
+    
     cbi _SFR_IO_ADDR(PORTB), DEBUG_LED_PIN
+    
+    sbi _SFR_IO_ADDR(BUZZER_DDR), BUZZER_PIN
+    cbi _SFR_IO_ADDR(BUZZER_PORT), BUZZER_PIN
     
     sei
 
@@ -357,24 +427,24 @@ loop:
 state_machine:
     lds r16, current_mode       ; Carrega o modo atual da RAM em r16
 
-    cpi r16, 1                  ; Compara r16 com 1 (MODO 1: relógio)
-    brne _sm_check2             ; Se não é 1, pula para verificar o próximo modo
-    rjmp _handle_mode1          ; Se é 1, salta para o handler do modo 1
+    cpi r16, FSM_MODE1          ; Compara r16 com FSM_MODE1 (MODO 1: relogio)
+    brne _sm_check2             ; Se nao e FSM_MODE1, pula para verificar o proximo modo
+    rjmp _handle_mode1          ; Se e FSM_MODE1, salta para o handler do modo 1
 
 _sm_check2:
-    cpi r16, 2                  ; Compara r16 com 2 (MODO 2: cronômetro parado)
-    brne _sm_check3             ; Se não é 2, pula para verificar o próximo modo
-    rjmp _handle_mode2_parado   ; Se é 2, salta para o handler do cronômetro parado
+    cpi r16, FSM_MODE2_STOPPED  ; Compara r16 com FSM_MODE2_STOPPED (MODO 2: cronometro parado)
+    brne _sm_check3             ; Se nao e FSM_MODE2_STOPPED, pula para verificar o proximo modo
+    rjmp _handle_mode2_parado   ; Se e FSM_MODE2_STOPPED, salta para o handler do cronometro parado
 
 _sm_check3:
-    cpi r16, 3                  ; Compara r16 com 3 (MODO 2: cronômetro contando)
-    brne _sm_check4             ; Se não é 3, pula para verificar o próximo modo
-    rjmp _handle_mode2_contando ; Se é 3, salta para o handler do cronômetro contando
+    cpi r16, FSM_MODE2_RUNNING  ; Compara r16 com FSM_MODE2_RUNNING (MODO 2: cronometro contando)
+    brne _sm_check4             ; Se nao e FSM_MODE2_RUNNING, pula para verificar o proximo modo
+    rjmp _handle_mode2_contando ; Se e FSM_MODE2_RUNNING, salta para o handler do cronometro contando
 
 _sm_check4:
-    cpi r16, 4                  ; Compara r16 com 4 (MODO 3: configuração)
-    brne _sm_end                ; Se não é 4, nenhum modo bateu: encerra
-    rjmp _handle_mode3          ; Se é 4, salta para o handler de configuração
+    cpi r16, FSM_MODE3          ; Compara r16 com FSM_MODE3 (MODO 3: configuracao)
+    brne _sm_end                ; Se nao e FSM_MODE3, nenhum modo bateu: encerra
+    rjmp _handle_mode3          ; Se e FSM_MODE3, salta para o handler de configuracao
 
 _sm_end:
     ret                         ; Retorna ao loop principal
@@ -399,10 +469,12 @@ _default:
     ; Consome a flag
     ldi r16, 0
     sts btn_mode_flag, r16
-
+    
     ; Transita para o MODO 2
-    ldi r16, 2
+    ldi r16, FSM_MODE2_STOPPED
     sts current_mode, r16
+    rcall buzzer_beep
+    rjmp _end_handle_mode1
 
 _check_uart_debug:
     ; Verifica se deve imprimir
@@ -426,24 +498,24 @@ _end_handle_mode1:
 ; ------------------- Comeco Estado 2 (Parado) --------------------------------
 
 _handle_mode2_parado:
-    ; Atualiza display com cronômetro atual
+    ; Atualiza display com cronï¿½metro atual
     lds r16, chrono_minutes_tens
     lds r17, chrono_minutes_units
     lds r18, chrono_seconds_tens
     lds r19, chrono_seconds_units
     rcall update_display_digits
         
-    ; MODE -> vai para MODO 3 (configuração)
+    ; MODE -> vai para MODO 3 (configuracao)
     lds r16, btn_mode_flag
     tst r16
     breq _check_start_parado
-    
+       
     ldi r16, 0
     sts btn_mode_flag, r16
-    ldi r16, 4                       ; MODO 3 = estado 4
+    ldi r16, FSM_MODE3                       ; MODO 3 = estado 4
     sts current_mode, r16
     
-    ; Copia valores atuais do relógio para o buffer de ajuste
+    ; Copia valores atuais do relï¿½gio para o buffer de ajuste
     lds r16, seconds_units
     sts adjust_seconds_units, r16
     lds r16, seconds_tens
@@ -452,11 +524,12 @@ _handle_mode2_parado:
     sts adjust_minutes_units, r16
     lds r16, minutes_tens
     sts adjust_minutes_tens, r16
-    
+
+    rcall buzzer_beep
     rjmp _end_handle_mode2_parado
 
 _check_start_parado:
-    ; START -> inicia cronômetro (vai para estado contando = 3)
+    ; START -> inicia cronometro (vai para estado contando = 3)
     lds r16, btn_start_flag
     tst r16
     breq _check_reset_parado
@@ -468,18 +541,19 @@ _check_start_parado:
     sts btn_start_flag, r16
        
     ; Muda para o estado contando
-    ldi r16, 3                       ; estado contando
+    ldi r16, FSM_MODE2_RUNNING                       ; estado contando
     sts current_mode, r16
     
     ldi r30, lo8(str_modo2_start)
     ldi r31, hi8(str_modo2_start)
     rcall uart_send_string
-    
+
+    rcall buzzer_beep
     rjmp _end_handle_mode2_parado
     
 
 _check_reset_parado:
-    ; RESET -> zera cronômetro (só se parado)
+    ; RESET -> zera cronOmetro
     lds r16, btn_reset_flag
     tst r16
     breq _end_handle_mode2_parado
@@ -498,6 +572,8 @@ _check_reset_parado:
     ldi r31, hi8(str_modo2_zero)
     rcall uart_send_string
 
+    rcall buzzer_beep
+
 _end_handle_mode2_parado:
     ret
 
@@ -505,18 +581,18 @@ _end_handle_mode2_parado:
 ; ------------------- Comeco Estado 2 (Contando) --------------------------------
 
 _handle_mode2_contando:
-    ; Incrementa o cronômetro a cada segundo
+    ; Incrementa o cronOmetro a cada segundo
     rcall chrono_clock
 
-    ; Atualiza display com cronômetro atual
+    ; Atualiza display com cronometro atual
     lds r16, chrono_minutes_tens
     lds r17, chrono_minutes_units
     lds r18, chrono_seconds_tens
     lds r19, chrono_seconds_units
     rcall update_display_digits
 
-    ; Apenas START responde ? para o cronômetro (volta para parado = 2)
-    ; MODE e RESET são ignorados mas as flags precisam ser consumidas
+    ; Apenas START responde ? para o cronometro (volta para parado = 2)
+    ; MODE e RESET sao ignorados mas as flags precisam ser consumidas
     lds r16, btn_mode_flag
     tst r16
     breq _check_start_contando
@@ -533,12 +609,15 @@ _check_start_contando:
     ldi r16, 0
     sts btn_start_flag, r16
     
-    ldi r16, 2                       ; volta para estado parado
+    ldi r16, FSM_MODE2_STOPPED                       ; volta para estado parado
     sts current_mode, r16
-    
+
     ldi r30, lo8(str_modo2_start)
     ldi r31, hi8(str_modo2_start)
     rcall uart_send_string
+
+    rcall buzzer_beep
+    rjmp _end_handle_mode2_contando
 
 _check_reset_contando:
     lds r16, btn_reset_flag
@@ -563,71 +642,84 @@ _handle_mode3:
     ; Verifica se o soft-timer do blink disparou
     lds r20, blink_event_flag
     tst r20
-    breq _blink_apply            ; flag não levantada: mantem estado atual
+    breq _blink_apply            ; flag nao levantada: mantem estado atual
 
     ; Consome a flag e alterna o estado de piscar
     ldi r20, 0
     sts blink_event_flag, r20
     lds r20, blink_state
-    ldi r21, 1
+    ldi r21, FSM_MODE1
     eor r20, r21                 ; toggle: 0 -> 1 ou 1 -> 0
     sts blink_state, r20
 
 _blink_apply:
-    ; Se blink_state == 0: mostra normal
-    ; Se blink_state == 1: apaga o dígito selecionado
+    ; --- Controle do Efeito Blink (Piscar) ---
+    ; blink_state = 0 -> Exibe o digito normalmente
+    ; blink_state = 1 -> Mascara/apaga o digito selecionado para ajuste
     lds r20, blink_state
     tst r20
-    breq _blink_done             ; estado 0: exibe normal, nao apaga nada
+    breq _blink_done             ; Se blink_state == 0, pula a filtragem e exibe normal
 
-    ; Apaga o digito selecionado
+    ; --- Aplicacao da Mascara no Digito Selecionado ---
+    ; Carrega qual digito (0 a 3) deve ser apagado neste ciclo de blink
     lds r20, selected_digit
-    tst r20
+    
+    tst r20                      ; Testa se e o digito 0 (dezena de minutos)
     brne _blink_d1
-    ldi r16, 0x0F                ; apaga posicao 0
+    ldi r16, 0x0F                ; Substitui valor original por 0x0F (apagado no decodificador BCD)
     rjmp _blink_done
+
 _blink_d1:
-    cpi r20, 1
+    cpi r20, 1                   ; Testa se e o digito 1 (unidade de minutos)
     brne _blink_d2
-    ldi r17, 0x0F                ; apaga posicao 1
+    ldi r17, 0x0F                ; Substitui valor original por 0x0F
     rjmp _blink_done
+
 _blink_d2:
-    cpi r20, 2
+    cpi r20, 2                   ; Testa se e o digito 2 (dezena de segundos)
     brne _blink_d3
-    ldi r18, 0x0F                ; apaga posicao 2
+    ldi r18, 0x0F                ; Substitui valor original por 0x0F
     rjmp _blink_done
+
 _blink_d3:
-    ldi r19, 0x0F                ; apaga posicao 3
+    ; Se chegou aqui, selected_digit obrigatoriamente e 3 (unidade de segundos)
+    ldi r19, 0x0F                ; Substitui valor original por 0x0F
 
 _blink_done:
+    ; Envia o arranjo de registradores (filtrados ou nao) para o buffer de exibicao
     rcall update_display_digits
 
-    ; MODE -> volta para MODO 1
+    ; --- Monitoramento de Transicao de Estado (Botao MODE) ---
     lds r16, btn_mode_flag
     tst r16
-    breq _check_start_mode3
-    
-    ; Consome a flag
+    breq _check_start_mode3      ; Se botao nao foi pressionado, segue fluxo normal do Modo 3
+
+    ; --- Salvar Alteracoes e Retornar ao Modo Relogio ---
     ldi r16, 0
-    sts btn_mode_flag, r16
-   
-    ; Copia buffer de ajuste de volta para o relógio real
+    sts btn_mode_flag, r16       ; Consome a flag do botao para evitar re-gatilho
+
+    ; Commit: Transfere os valores do buffer de ajuste temporario para o relogio real
     lds r16, adjust_seconds_units
     sts seconds_units, r16
+    
     lds r16, adjust_seconds_tens
     sts seconds_tens, r16
+    
     lds r16, adjust_minutes_units
     sts minutes_units, r16
+    
     lds r16, adjust_minutes_tens
     sts minutes_tens, r16
     
-    ; Volta para o modo 1
+    ; Altera o estado do sistema de volta para o MODO 1 (Relogio Principal)
     ldi r16, 1
     sts current_mode, r16
-    rjmp _end_handle_mode3
+    
+    rcall buzzer_beep            ; Feedback sonoro de salvamento concluido
+    rjmp _end_handle_mode3       ; Sai da maquina de estados deste ciclo
 
 _check_start_mode3:
-    ; START -> avança o dígito selecionado (0 -> 1 -> 2 -> 3 -> 0)
+    ; START -> avanca o digito selecionado (0 -> 1 -> 2 -> 3 -> 0)
     lds r16, btn_start_flag
     tst r16
     breq _check_reset_mode3
@@ -641,12 +733,12 @@ _check_start_mode3:
     inc r16
     cpi r16, 4			; Verifica se o valor e igual a 4
     brlo _save_selected_digit	; Se for menor que 4, pula para _save_selected_digit
-    ldi r16, 0			; Se nao zera o indiceã
+    ldi r16, 0			; Se nao zera o indice
 _save_selected_digit:
     ; Salva o digito que ta selecionado
     sts selected_digit, r16
     
-    ; Imprime qual dígito está sendo ajustado
+    ; Imprime qual digito esta sendo ajustado
     tst r16
     brne _print_digit1
     ldi r30, lo8(str_modo3_dmin)   ; digito 0 = dezena dos minutos
@@ -740,6 +832,7 @@ _apply_display:
 
 _end_display_pool:
     ret
+    
 ; ------------------- Fim Display Pool --------------------------------------
 ; ------------------- Comeco Main Clock --------------------------------------
 main_clock:
@@ -752,14 +845,14 @@ main_clock:
     ldi r16, 0
     sts main_clock_event_flag, r16
     
-    ; Levanta flag de impressão UART
+    ; Levanta flag de impressao UART
     ldi r16, 1
     sts uart_print_flag, r16
     
     ; --- Incrementa unidade dos segundos (0-9) ---
     lds r16, seconds_units
     inc r16
-    cpi r16, 10                      ; Chegou em 10? (estouro de dï¿½gito)
+    cpi r16, 10                      ; Chegou em 10? (estouro de digito)
     brlo _save_sec_units             ; Nao: salva e encerra
     ldi r16, 0                       ; Sim: zera e propaga para dezena
     sts seconds_units, r16
@@ -788,7 +881,7 @@ _inc_min_units:
     lds r16, minutes_units
     inc r16
     cpi r16, 10                      ; Chegou em 10? (estouro de digito)
-    brlo _save_min_units             ; Nï¿½o: salva e encerra
+    brlo _save_min_units             ; Nao: salva e encerra
     ldi r16, 0                       ; Sim: zera e propaga para dezena dos minutos
     sts minutes_units, r16
     rjmp _inc_min_tens
@@ -877,52 +970,52 @@ _end_chrono_clock:
 ; ------------------- Fim Chrono Clock ---------------------------------------   
     
 increment_selected_digit:
-    lds r16, selected_digit      ; Carrega o índice do dígito selecionado (0-3)
+    lds r16, selected_digit      ; Carrega o indice do digito selecionado (0-3)
 
-    cpi r16, 0                   ; É o dígito 0?
-    brne _check_digit1           ; Não: verifica o próximo
+    cpi r16, 0                   ; E o digito 0?
+    brne _check_digit1           ; Nao: verifica o proximo
     lds r17, adjust_minutes_tens        ; Sim: carrega a dezena dos minutos
     inc r17                      ; Incrementa
     cpi r17, 6                   ; Passou de 5? (dezena dos minutos vai de 0 a 5)
-    brlo _save_min_tens_adj      ; Não: salva o valor incrementado
-    ldi r17, 0                   ; Sim: wrap ? volta para 0
+    brlo _save_min_tens_adj      ; Nao: salva o valor incrementado
+    ldi r17, 0                   ; Sim: wrap - volta para 0
 _save_min_tens_adj:
     sts adjust_minutes_tens, r17        ; Salva o novo valor da dezena dos minutos
-    rjmp _end_increment          ; Encerra ? só um dígito por pressão de RESET
+    rjmp _end_increment          ; Encerra - so um digito por pressao de RESET
 
 _check_digit1:
-    cpi r16, 1                   ; É o dígito 1?
-    brne _check_digit2           ; Não: verifica o próximo
+    cpi r16, 1                   ; E o digito 1?
+    brne _check_digit2           ; Nao: verifica o proximo
     lds r17, adjust_minutes_units       ; Sim: carrega a unidade dos minutos
     inc r17                      ; Incrementa
     cpi r17, 10                  ; Passou de 9? (unidade vai de 0 a 9)
-    brlo _save_min_units_adj     ; Não: salva o valor incrementado
-    ldi r17, 0                   ; Sim: wrap ? volta para 0
+    brlo _save_min_units_adj     ; Nao: salva o valor incrementado
+    ldi r17, 0                   ; Sim: wrap - volta para 0
 _save_min_units_adj:
     sts adjust_minutes_units, r17       ; Salva o novo valor da unidade dos minutos
     rjmp _end_increment
 
 _check_digit2:
-    ; --- Dígito 2: dezena dos segundos (range 0-5) ---
-    cpi r16, 2                   ; É o dígito 2?
-    brne _check_digit3           ; Não: só resta o dígito 3, cai no próximo bloco
+    ; --- Digito 2: dezena dos segundos (range 0-5) ---
+    cpi r16, 2                   ; E o digito 2?
+    brne _check_digit3           ; Nao: so resta o digito 3, cai no proximo bloco
     lds r17, adjust_seconds_tens        ; Sim: carrega a dezena dos segundos
     inc r17                      ; Incrementa
     cpi r17, 6                   ; Passou de 5? (dezena dos segundos vai de 0 a 5)
-    brlo _save_sec_tens_adj      ; Não: salva o valor incrementado
-    ldi r17, 0                   ; Sim: wrap ? volta para 0
+    brlo _save_sec_tens_adj      ; Nao: salva o valor incrementado
+    ldi r17, 0                   ; Sim: wrap - volta para 0
 _save_sec_tens_adj:
     sts adjust_seconds_tens, r17        ; Salva o novo valor da dezena dos segundos
     rjmp _end_increment
 
 _check_digit3:
-    ; --- Dígito 3: unidade dos segundos (posição mais à direita, range 0-9) ---
-    ; Não precisa de cpi ? se chegou aqui, só pode ser o dígito 3
+    ; --- Digito 3: unidade dos segundos (posicao mais a direita, range 0-9) ---
+    ; Nao precisa de cpi - se chegou aqui, so pode ser o digito 3
     lds r17, adjust_seconds_units       ; Carrega a unidade dos segundos
     inc r17                      ; Incrementa
     cpi r17, 10                  ; Passou de 9? (unidade vai de 0 a 9)
-    brlo _save_sec_units_adj     ; Não: salva o valor incrementado
-    ldi r17, 0                   ; Sim: wrap ? volta para 0
+    brlo _save_sec_units_adj     ; Nao: salva o valor incrementado
+    ldi r17, 0                   ; Sim: wrap - volta para 0
 _save_sec_units_adj:
     sts adjust_seconds_units, r17       ; Salva o novo valor da unidade dos segundos
 
@@ -952,10 +1045,10 @@ _uart_wait:
     ret
     
 uart_send_string:
-    lpm r16, Z+              ; carrega byte da flash e avança ponteiro
-    tst r16                  ; é o terminador nulo?
+    lpm r16, Z+              ; carrega byte da flash e avanca ponteiro
+    tst r16                  ; e o terminador nulo?
     breq _end_uart_string    ; sim: encerra
-    rcall uart_send_char     ; não: envia o caractere
+    rcall uart_send_char     ; nao: envia o caractere
     rjmp uart_send_string
 _end_uart_string:
     ret
@@ -963,7 +1056,7 @@ _end_uart_string:
 uart_send_time:
     ; Envia dezena dos minutos
     lds r16, minutes_tens
-    ori r16, '0'             ; converte dígito para ASCII
+    ori r16, '0'             ; converte digito para ASCII
     rcall uart_send_char
 
     ; Envia unidade dos minutos
@@ -990,4 +1083,21 @@ uart_send_time:
     rcall uart_send_char
     ldi r16, 13
     rcall uart_send_char
+    ret
+    
+buzzer_beep:
+    ; Carrega duracao e ativa o buzzer
+    ldi r16, BUZZER_DURATION
+    sts buzzer_counter, r16
+    ldi r16, 1
+    sts buzzer_active, r16
+
+    ; Liga Timer2: prescaler 64
+    ldi r16, (1 << CS22)
+    sts TCCR2B, r16
+
+    ; Habilita interrupcao do Timer2
+    lds r16, TIMSK2
+    ori r16, (1 << OCIE2A)
+    sts TIMSK2, r16
     ret
